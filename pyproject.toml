@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "borg-archive"
+version = "0.1.0"
+description = "A tool for creating single-file compressed archives using Borg Backup"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.1.8",
+    "rich>=13.9.4",
+]
+license = {file= "LICENSE.md"}
+
+[project.scripts]
+borg-archive = "borg_archive.cli:main"

@@ -1,0 +1,154 @@
+Metadata-Version: 2.4
+Name: borg-archive
+Version: 0.1.0
+Summary: A tool for creating single-file compressed archives using Borg Backup
+License: # MIT License
+        
+        ## Copyright 2025 Jason L. Causey
+        
+        Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+        
+        The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+        
+        THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+        
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+License-File: LICENSE.md
+Requires-Dist: click>=8.1.8
+Requires-Dist: rich>=13.9.4
+Dynamic: license-file
+
+# borg-archive
+
+A Python tool for creating single-file compressed archives using [Borg Backup](https://www.borgbackup.org/).
+
+**WARNING:** This tool is still in an early state. Please consider it "alpha" quality software at this point and always keep a backup of your data using another means in addition to `borg-archive`.
+
+This tool allows you to create, extract, mount, and update Borg archives that are stored as single compressed files. It's particularly useful for sharing and archiving versioned datasets for research purposes.
+
+## Features
+
+- Create single-file compressed archives using Borg Backup
+- Extract archives to a directory
+- Mount archives read-only (requires FUSE)
+- Update archives with new changes
+- List available versions/tags in an archive
+- Automatic compression using zstd
+- Modern CLI with rich terminal output
+
+## Requirements
+
+- Python 3.12 or later
+- [Borg Backup](https://www.borgbackup.org/)
+- [SquashFS](https://github.com/plougher/squashfs-tools) (optional, but recommended)
+    - `tar` (usually pre-installed) if SquashFS is not installed.
+- `zstd`, `gzip` (`pigz` is optional but recommended if `tar` is used)
+- FUSE (optional, required for mount functionality)
+  - For macOS: [macFuse](https://macfuse.github.io/)
+
+## Installation
+
+You can install `borg-archive` using pip:
+
+```bash
+pip install borg-archive
+```
+
+Or for a more isolated installation, use [pipx](https://pypa.github.io/pipx/):
+
+```bash
+pipx install borg-archive
+```
+
+Or, you can use `uv tool` to install:
+
+```bash
+uv tool install borg-archive
+```
+
+## Usage
+
+### Create a New Archive
+
+```bash
+borg-archive create archive.baz /path/to/data
+```
+
+### Extract an Archive
+
+Latest version:
+```bash
+borg-archive extract archive.baz /path/to/output
+```
+
+Specific version:
+```bash
+borg-archive extract archive.baz /path/to/output --tag selected-tag
+```
+
+### List Available Tags
+
+```bash
+borg-archive list archive.baz
+```
+
+### Mount an Archive (Read-only)
+
+```bash
+borg-archive mount archive.baz /path/to/mount
+```
+
+### Unmount an Archive
+
+```bash
+borg-archive umount /path/to/mount
+```
+
+### Update an Archive
+
+```bash
+borg-archive update archive.baz /path/to/data
+```
+
+With a specific tag:
+```bash
+borg-archive update archive.baz /path/to/data --tag custom-tag
+```
+
+## Python API
+
+You can also use borg-archive as a Python library:
+
+```python
+from pathlib import Path
+from borg_archive import BorgArchive
+
+# Create a new archive
+with BorgArchive(Path("archive.baz")) as archive:
+    archive.create(Path("/path/to/data"))
+
+# Extract an archive
+with BorgArchive(Path("archive.baz")) as archive:
+    archive.extract(Path("/path/to/output"))
+
+# List tags
+with BorgArchive(Path("archive.baz")) as archive:
+    archive.list_tags()
+
+# Mount an archive
+with BorgArchive(Path("archive.baz")) as archive:
+    archive.mount(Path("/path/to/mount"))
+
+# Update an archive
+with BorgArchive(Path("archive.baz")) as archive:
+    archive.update(Path("/path/to/data"))
+```
+
+## License
+
+MIT License - see LICENSE.md for details.
+
+## Acknowledgments
+
+This project was inspired by the need for a better way to store and share versioned datasets, and builds upon the excellent [Borg Backup](https://www.borgbackup.org/) tool.

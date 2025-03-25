@@ -1,0 +1,2 @@
+[console_scripts]
+borg-archive = borg_archive.cli:main
