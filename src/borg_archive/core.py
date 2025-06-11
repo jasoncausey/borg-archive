@@ -221,6 +221,7 @@ class BorgArchive:
                     run_command(
                         [
                             "unsquashfs",
+                            "-f",
                             "-no-progress",
                             "-quiet",
                             "-dest",
