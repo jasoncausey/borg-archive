@@ -7,3 +7,4 @@
 **/.vscode
 **/uv.lock
 build
+**/todo.*

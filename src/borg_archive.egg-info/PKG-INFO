@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: borg-archive
-Version: 0.1.0
+Version: 0.1.1
 Summary: A tool for creating single-file compressed archives using Borg Backup
 License: # MIT License
         

@@ -6,7 +6,7 @@
  Copyright 2025 Jason L. Causey
 
  Permission is hereby granted, free of charge, to any person obtaining a copy of
- this software and associated documentation files (the “Software”), to deal in
+ this software and associated documentation files (the "Software"), to deal in
  the Software without restriction, including without limitation the rights to
  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
  of the Software, and to permit persons to whom the Software is furnished to do
@@ -15,7 +15,7 @@
  The above copyright notice and this permission notice shall be included in all
  copies or substantial portions of the Software.
 
- THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
  FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
  COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
@@ -47,12 +47,14 @@ def check_required_commands() -> None:
             raise CommandNotFoundError(f"Required command '{cmd}' not found in PATH")
 
 
-def get_best_compressor(archiver: str = "tar") -> Tuple[str, str]:
+def get_best_compressor(archiver: str = "tar", max_compression: bool = True) -> Tuple[str, str]:
     """
     Determine the best available compression command and its decompression counterpart.
 
     Args:
         archiver: The archiver to get compression commands for, either 'tar' (default) or 'squashfs'
+        max_compression: If True, use maximum compression (level 9); if False, use light
+                         compression (level 1) suitable for already-compressed borg data.
 
     Returns:
         Tuple[str, str]: A tuple of (compress_cmd, decompress_cmd)
@@ -66,22 +68,23 @@ def get_best_compressor(archiver: str = "tar") -> Tuple[str, str]:
         CommandNotFoundError: If no supported compression command is found
         RuntimeError: If an invalid archiver type is specified
     """
+    level = "9" if max_compression else "1"
     if archiver == "tar":
         if shutil.which("zstd"):
-            return "zstd -9", "zstd -d"
+            return f"zstd -{level}", "zstd -d"
         elif shutil.which("pigz"):
-            return "pigz -9", "pigz -d"
+            return f"pigz -{level}", "pigz -d"
         elif shutil.which("gzip"):
-            return "gzip -9", "gzip -d"
+            return f"gzip -{level}", "gzip -d"
         else:
             raise CommandNotFoundError(
                 "No supported compression command found (tried: zstd, pigz, gzip)"
             )
     elif archiver == "squashfs":
         if shutil.which("zstd"):
-            return "-comp zstd -Xcompression-level 9", "-comp zstd"
+            return f"-comp zstd -Xcompression-level {level}", "-comp zstd"
         elif shutil.which("gzip"):
-            return "-comp gzip -Xcompression-level 9", "-comp gzip"
+            return f"-comp gzip -Xcompression-level {level}", "-comp gzip"
         else:
             raise CommandNotFoundError(
                 "No supported compression command found (tried: zstd, gzip)"
@@ -110,7 +113,6 @@ def get_best_archiver(file_path: Optional[Path] = None) -> str:
             if fin.read(4) == b"hsqs":
                 is_squashfs = True
     has_squashfs = bool(shutil.which("mksquashfs"))
-    is_squashfs = is_squashfs if is_squashfs is not None else has_squashfs
 
     if file_path is not None:
         if is_squashfs:
@@ -127,6 +129,8 @@ def run_command(
     input: Optional[bytes] = None,
     encoding: Optional[str] = "utf-8",
     suppress_stderr=False,
+    cwd: Optional[Path] = None,
+    env: Optional[dict] = None,
 ) -> subprocess.CompletedProcess:
     """
     Run a single command and handle its output.
@@ -138,6 +142,8 @@ def run_command(
         input: Optional bytes to pass as stdin
         encoding: Text encoding to use, or None for binary mode
         suppress_stderr: Whether to mute standard error output
+        cwd: Working directory for the command
+        env: Environment variables for the command (defaults to current process env)
 
     Returns:
         CompletedProcess instance
@@ -153,6 +159,8 @@ def run_command(
             input=input,
             text=encoding is not None,
             encoding=encoding,
+            cwd=cwd,
+            env=env,
         )
     except subprocess.CalledProcessError as e:
         console.print(f"[red]Error running command:[/red] {' '.join(cmd)}")
@@ -170,6 +178,8 @@ def run_pipeline(
     stdout: Optional[Union[TextIO, BinaryIO]] = None,
     encoding: Optional[str] = "utf-8",
     suppress_stderr: bool = False,
+    cwd: Optional[Path] = None,
+    env: Optional[dict] = None,
 ) -> subprocess.CompletedProcess:
     """
     Run a pipeline of commands, connecting stdout of each to stdin of the next.
@@ -181,6 +191,8 @@ def run_pipeline(
         stdout: Optional file object to use as stdout for the last command
         encoding: Text encoding to use, or None for binary mode
         suppress_stderr: Whether to mute standard error output
+        cwd: Working directory for all commands in the pipeline
+        env: Environment variables for all commands (defaults to current process env)
 
     Returns:
         CompletedProcess instance with output from final command
@@ -203,6 +215,8 @@ def run_pipeline(
         stderr=stderr,
         text=encoding is not None,
         encoding=encoding,
+        cwd=cwd,
+        env=env,
     )
     processes.append(first_proc)
 
@@ -215,6 +229,8 @@ def run_pipeline(
             stderr=stderr,
             text=encoding is not None,
             encoding=encoding,
+            cwd=cwd,
+            env=env,
         )
         processes.append(proc)
         # Close previous process's stdout to avoid deadlocks
@@ -229,41 +245,43 @@ def run_pipeline(
             stderr=stderr,
             text=encoding is not None,
             encoding=encoding,
+            cwd=cwd,
+            env=env,
         )
         processes.append(last_proc)
         processes[-2].stdout.close()
 
     # Collect output and wait for completion
-    stdout = stderr_output = None
+    stdout_out = stderr_output = None
     return_codes = []
 
     for proc in processes:
         out, err = proc.communicate()
         return_codes.append(proc.returncode)
-        if proc == processes[-1] and not stdout:
-            stdout = out
+        if proc == processes[-1] and not stdout_out:
+            stdout_out = out
         stderr_output = ""
         if proc == processes[-1] and not suppress_stderr:
             stderr_output = err
 
     # Check return codes if requested
     if check and any(code != 0 for code in return_codes):
-        failed_cmd = cmds[
-            return_codes.index(next(code for code in return_codes if code != 0))
-        ]
+        # Find the first failing process by index, not by code value
+        failed_idx = next(i for i, code in enumerate(return_codes) if code != 0)
+        failed_cmd = cmds[failed_idx]
         error = subprocess.CalledProcessError(
-            return_codes[-1], failed_cmd, stdout, stderr_output
+            return_codes[failed_idx], failed_cmd, stdout_out, stderr_output
         )
         console.print(f"[red]Error in pipeline command:[/red] {' '.join(failed_cmd)}")
-        if stdout:
-            console.print("[yellow]stdout:[/yellow]", stdout)
+        if stdout_out:
+            console.print("[yellow]stdout:[/yellow]", stdout_out)
         if stderr_output:
             console.print("[red]stderr:[/red]", stderr_output)
         raise error
 
     # Return CompletedProcess instance
     return subprocess.CompletedProcess(
-        cmds[-1], return_codes[-1], stdout, stderr_output
+        cmds[-1], return_codes[-1], stdout_out, stderr_output
     )
 
 

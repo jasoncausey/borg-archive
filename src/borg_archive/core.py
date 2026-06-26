@@ -5,7 +5,7 @@
  Copyright 2025 Jason L. Causey
 
  Permission is hereby granted, free of charge, to any person obtaining a copy of
- this software and associated documentation files (the “Software”), to deal in
+ this software and associated documentation files (the "Software"), to deal in
  the Software without restriction, including without limitation the rights to
  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
  of the Software, and to permit persons to whom the Software is furnished to do
@@ -14,7 +14,7 @@
  The above copyright notice and this permission notice shall be included in all
  copies or substantial portions of the Software.
 
- THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
  FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
  COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
@@ -120,24 +120,38 @@ class BorgArchive:
                 self.__delete_borg_repo()
             self.__remove_temp_dir()
 
-    def __set_borg_environ(self):
-        """Set environment variables needed for borg actions in this context."""
-        os.environ["BORG_RELOCATED_REPO_ACCESS_IS_OK"] = "yes"
-        os.environ["BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK"] = "yes"
+    def __borg_environ(self) -> dict:
+        """Return environment variables needed for borg actions, without mutating os.environ."""
+        return {
+            **os.environ,
+            "BORG_RELOCATED_REPO_ACCESS_IS_OK": "yes",
+            "BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK": "yes",
+        }
 
-    def __create_compressed_archive(self, repo_dir: Optional[Path] = None) -> None:
+    def __create_compressed_archive(
+        self, repo_dir: Optional[Path] = None, max_compression: bool = True
+    ) -> None:
         """Create the compressed archive of the Borg repository, using squashfs if available
-        or tar if squashfs is not available."""
-        # Create compressed tarfile
+        or tar if squashfs is not available.
+
+        Writes to a temporary file in the same directory as the target archive, then atomically
+        replaces the target on success so a partial write never destroys the existing archive.
+        """
         repo_dir = self.borg_dir if repo_dir is None else repo_dir
         best_archiver = get_best_archiver()
+        target = self.archive_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+
         if best_archiver == "tar":
-            compress_cmd, _ = get_best_compressor()
+            compress_cmd, _ = get_best_compressor("tar", max_compression=max_compression)
             with console.status("Compressing archive..."):
-                cwd = os.getcwd()
-                os.chdir(repo_dir.parent)
+                tmp_fd, tmp_path_str = tempfile.mkstemp(
+                    dir=target.parent, suffix=".tmp"
+                )
+                tmp_path = Path(tmp_path_str)
                 try:
-                    with open(self.archive_path, "wb") as arch_fp:
+                    with os.fdopen(tmp_fd, "wb") as arch_fp:
+                        tmp_fd = None  # ownership transferred to context manager
                         run_pipeline(
                             [
                                 # Use --format=pax to ensure consistent tar format
@@ -147,31 +161,49 @@ class BorgArchive:
                             check=True,
                             stdout=arch_fp,
                             encoding=None,  # Use binary mode
+                            cwd=repo_dir.parent,
                         )
+                    os.replace(tmp_path, target)
                 except Exception as e:
                     raise ArchiveError(f"Failed to create tar archive: {e}")
                 finally:
-                    os.chdir(cwd)
+                    # Runs even on KeyboardInterrupt: close a leaked fd and drop
+                    # the temp file if the atomic replace never happened.
+                    if tmp_fd is not None:
+                        os.close(tmp_fd)
+                    if tmp_path.exists():
+                        tmp_path.unlink(missing_ok=True)
         elif best_archiver == "squashfs":
-            # Good time/size tradeoff by using default squashfs compression
+            compress_flags, _ = get_best_compressor(
+                "squashfs", max_compression=max_compression
+            )
             with console.status("Compressing archive..."):
-                cwd = os.getcwd()
-                os.chdir(repo_dir.parent)
+                tmp_fd, tmp_path_str = tempfile.mkstemp(
+                    dir=target.parent, suffix=".tmp"
+                )
+                os.close(tmp_fd)
+                tmp_path = Path(tmp_path_str)
                 try:
                     run_command(
                         [
                             "mksquashfs",
                             str(repo_dir),
-                            str(self.archive_path),
+                            str(tmp_path),
                             "-quiet",
                             "-noappend",
                             "-no-xattrs",
                         ]
+                        + compress_flags.split(),
+                        cwd=repo_dir.parent,
                     )
+                    os.replace(tmp_path, target)
                 except Exception as e:
                     raise ArchiveError(f"Failed to create squashfs archive: {e}")
                 finally:
-                    os.chdir(cwd)
+                    # Runs even on KeyboardInterrupt: drop the temp file if the
+                    # atomic replace never happened.
+                    if tmp_path.exists():
+                        tmp_path.unlink(missing_ok=True)
         else:
             raise ArchiveError(
                 f"Internal error: Unknown 'best archiver' found: {best_archiver}."
@@ -246,13 +278,13 @@ class BorgArchive:
         tmp_repo_path = tmp_repo_path if tmp_repo_path is not None else self.borg_dir
 
         try:
-            self.__set_borg_environ()
             result = run_command(
                 ["borg", "info", "--error", "--json", tmp_repo_path],
                 capture_output=True,
                 encoding="utf-8",
                 check=False,
                 suppress_stderr=True,
+                env=self.__borg_environ(),
             )
 
             if result.returncode != 0:
@@ -293,11 +325,11 @@ class BorgArchive:
 
         # Delete the borg repo
         try:
-            self.__set_borg_environ()
             run_command(
                 ["borg", "delete", "--error", "--force", self.borg_dir],
                 check=False,
                 suppress_stderr=True,
+                env=self.__borg_environ(),
             )
         except Exception as e:
             if DEBUG:
@@ -320,6 +352,9 @@ class BorgArchive:
         """
         Check if a directory is a Borg repository.
 
+        Uses a read-only file-based check (looks for the repo config marker) so it
+        never mutates the directory being tested.
+
         Note:
             This method is designed to be fast to reject non-Borg directories.
             It does not guarantee a valid repository in the way `borg check` would.
@@ -330,25 +365,14 @@ class BorgArchive:
         Returns:
             bool: True if the directory is a Borg repository, False otherwise
         """
-
+        repo_path = Path(repo_path)
+        config_file = repo_path / "config"
+        if not config_file.is_file():
+            return False
         try:
-            # An attempt to initialize the repository should
-            # FAIL with returncode = 2 and "A repository already exists at"
-            # in stderr if and only if the directory is already a repository.
-            subprocess.run(
-                ["borg", "init", Path(repo_path), "--encryption", "none"],
-                check=True,
-                capture_output=True,
-                encoding="utf-8",
-            )
-        except subprocess.CalledProcessError as e:
-            if e.returncode == 2 and e.stderr.startswith(
-                "A repository already exists at"
-            ):
-                return True
-        except Exception as e:
-            raise
-        return False
+            return "[repository]" in config_file.read_text(encoding="utf-8")
+        except OSError:
+            return False
 
     def create(
         self,
@@ -356,6 +380,7 @@ class BorgArchive:
         encryption: str = "none",
         expanded: bool = False,
         borg_options: Optional[list[str]] = None,
+        max_compression: bool = False,
     ) -> None:
         """
         Create a new archive.
@@ -365,6 +390,9 @@ class BorgArchive:
             encryption: Encryption mode for borg
             expanded: Set True to create an expanded borg repo, not an archive file
             borg_options: Additional borg options
+            max_compression: If True, apply maximum compression to the outer archive layer.
+                             Default is False (light outer compression, since borg already
+                             compresses internally with zstd,9).
         """
         source_dir = Path(source_dir)
         if not source_dir.is_dir():
@@ -390,8 +418,6 @@ class BorgArchive:
             raise CreationError(f"Failed to initialize Borg repository: {e}")
 
         # Create archive
-        cwd = os.getcwd()
-        os.chdir(source_dir.parent)
         try:
             run_command(
                 [
@@ -405,18 +431,17 @@ class BorgArchive:
                     source_dir.name,
                 ],
                 encoding="utf-8",  # Use text mode for borg output
+                cwd=source_dir.parent,
             )
         except Exception as e:
             raise CreationError(f"Failed to create repository: {e}")
-        finally:
-            os.chdir(cwd)
         if not expanded:
             try:
-                self.__create_compressed_archive()
+                self.__create_compressed_archive(max_compression=max_compression)
             except Exception as e:
                 raise CreationError(f"Failed to create archive file: {e}")
 
-    def collapse(self, repo_dir: Path, retain_repo=False) -> None:
+    def collapse(self, repo_dir: Path, retain_repo=False, max_compression: bool = False) -> None:
         """
         Collapse an expanded Borg repo directory to an archive file.
 
@@ -424,6 +449,7 @@ class BorgArchive:
             repo_dir: Path to the expanded Borg repository directory
             retain_repo: If True, keep the repository directory after collapsing
                          If False (default), delete the repository directory
+            max_compression: If True, apply maximum compression to the outer archive layer.
 
         Raises:
             CollapseError: If the directory is not a valid Borg repository
@@ -436,9 +462,10 @@ class BorgArchive:
             )
         self.borg_dir = repo_dir
         try:
-            self.__create_compressed_archive(repo_dir)
+            self.__create_compressed_archive(repo_dir, max_compression=max_compression)
         except Exception as e:
             raise ArchiveError(f"Failed to create archive file: {e}")
+        # Only delete the source repo after the new archive is fully written
         if not retain_repo:
             self.__delete_borg_repo()
             self.__remove_temp_dir(repo_dir)
@@ -448,12 +475,24 @@ class BorgArchive:
         Expand the archived Borg repository into `repo_dir`.
 
         Args:
-            repo_dir: Directory where the repository will be expanded
+            repo_dir: Directory where the repository will be expanded. Must not exist
+                      or must be empty; a non-empty target is an error to prevent
+                      accidental data loss.
 
         Raises:
-            ExpandError: If there's an error expanding the archive
+            ExpandError: If the target directory is non-empty, or if there's an error
+                         expanding the archive
         """
         repo_dir = Path(repo_dir)
+        if repo_dir.exists() and not repo_dir.is_dir():
+            raise ExpandError(
+                f"Target path '{repo_dir}' exists and is not a directory."
+            )
+        if repo_dir.is_dir() and any(repo_dir.iterdir()):
+            raise ExpandError(
+                f"Target directory '{repo_dir}' already exists and is non-empty. "
+                "Remove it or choose an empty directory."
+            )
         ensure_dir(repo_dir)
         try:
             self.__extract_compressed_archive(repo_dir=repo_dir)
@@ -483,22 +522,19 @@ class BorgArchive:
             raise ExtractError(f"Failed to extract archive: {e}")
 
         # Extract from borg archive
-        cwd = Path.cwd()
-        os.chdir(output_dir)
         try:
             # Get tag to extract
             if not tag:
                 tag = self.get_most_recent_tag()
-            self.__set_borg_environ()
             run_command(
                 ["borg", "extract", "--error", "--progress", f"{self.borg_dir}::{tag}"],
                 encoding="utf-8",  # Use text mode for borg output
                 suppress_stderr=True,
+                cwd=output_dir,
+                env=self.__borg_environ(),
             )
         except Exception as e:
             raise ExtractError(f"Failed to extract archive: {e}")
-        finally:
-            os.chdir(cwd)
 
     def generate_next_tag(self, tag: Optional[str] = None) -> str:
         """
@@ -529,8 +565,16 @@ class BorgArchive:
 
         Returns:
             str: The most recent tag (last in the list of tags)
+
+        Raises:
+            ArchiveError: If the archive contains no tags
         """
-        return self.get_tag_list()[-1]
+        tags = self.get_tag_list()
+        if not tags:
+            raise ArchiveError(
+                "Archive contains no tags. The repository may be empty or corrupted."
+            )
+        return tags[-1]
 
     def get_tag_list(self, full_output: Optional[bool] = False) -> list:
         """
@@ -545,7 +589,6 @@ class BorgArchive:
         """
         # List borg archives
         format_str = "{archive:<36} {time}{NL}" if full_output else "{archive}{NL}"
-        self.__set_borg_environ()
         proc1 = run_command(
             [
                 "borg",
@@ -558,6 +601,7 @@ class BorgArchive:
             capture_output=True,
             encoding="utf-8",  # Use text mode for borg output
             suppress_stderr=True,
+            env=self.__borg_environ(),
         )
         return proc1.stdout.splitlines()
 
@@ -617,10 +661,10 @@ class BorgArchive:
             # Get tag to extract
             if not tag:
                 tag = self.get_most_recent_tag()
-            self.__set_borg_environ()
             run_command(
                 ["borg", "mount", "--error", f"{self.borg_dir}::{tag}", str(mount_dir)],
                 encoding="utf-8",  # Use text mode for borg output
+                env=self.__borg_environ(),
             )
             console.print(
                 f"Mounted archive to [green]'{mount_dir}'[/green] (read-only)"
@@ -651,7 +695,7 @@ class BorgArchive:
             # path cache file there now.
             if (mount_dir / ".borg-repo").exists():
                 # Get the path to the temporary Borg repo that was mounted:
-                mounted_repo = Path(mount_dir / ".borg-repo").read_text()
+                mounted_repo = Path((mount_dir / ".borg-repo").read_text())
                 # Try unmounting in case it is squashfs.
                 self.__unmount_squashfs(mounted_repo)
                 # Clean it from caches
@@ -664,13 +708,19 @@ class BorgArchive:
         except Exception as e:
             raise MountError(f"Failed to unmount archive: {e}")
 
-    def update(self, source_dir_or_repo: Path, tag: Optional[str] = None) -> None:
+    def update(
+        self,
+        source_dir_or_repo: Path,
+        tag: Optional[str] = None,
+        max_compression: bool = False,
+    ) -> None:
         """
         Update archive with changes from the raw dataset or from an expanded repository.
 
         Args:
             source_dir_or_repo: Directory containing changes or an expanded repository
             tag: Tag for the update (default: auto-increment)
+            max_compression: If True, apply maximum compression to the outer archive layer.
 
         Raises:
             ValidationError: If the source directory doesn't exist
@@ -712,30 +762,26 @@ class BorgArchive:
                         f"to unmount it, then try updating again."
                     )
                 # Create new borg archive (within the existing borg _repo_.)
-                cwd = os.getcwd()
-                os.chdir(source_dir_or_repo.parent)
-                try:
-                    tag = self.generate_next_tag(tag)
-                    self.__set_borg_environ()
-                    run_command(
-                        [
-                            "borg",
-                            "create",
-                            "--compression",
-                            "zstd,9",
-                            "--error",
-                            "--progress",
-                            f"{self.borg_dir}::{tag}",
-                            source_dir_or_repo.name,
-                        ],
-                        encoding="utf-8",  # Use text mode for borg output
-                        suppress_stderr=True,
-                    )
-                finally:
-                    os.chdir(cwd)
+                tag = self.generate_next_tag(tag)
+                run_command(
+                    [
+                        "borg",
+                        "create",
+                        "--compression",
+                        "zstd,9",
+                        "--error",
+                        "--progress",
+                        f"{self.borg_dir}::{tag}",
+                        source_dir_or_repo.name,
+                    ],
+                    encoding="utf-8",  # Use text mode for borg output
+                    suppress_stderr=True,
+                    cwd=source_dir_or_repo.parent,
+                    env=self.__borg_environ(),
+                )
 
             if updating_archive:
                 # Create new compressed tarfile
-                self.__create_compressed_archive()
+                self.__create_compressed_archive(max_compression=max_compression)
         except Exception as e:
             raise UpdateError(f"Failed to update archive: {e}")

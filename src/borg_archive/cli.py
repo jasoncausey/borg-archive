@@ -8,7 +8,7 @@ Command-line interface for borg-archive, a wrapper that allows Borg Backup to
  Copyright 2025 Jason L. Causey
 
  Permission is hereby granted, free of charge, to any person obtaining a copy of
- this software and associated documentation files (the “Software”), to deal in
+ this software and associated documentation files (the "Software"), to deal in
  the Software without restriction, including without limitation the rights to
  use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
  of the Software, and to permit persons to whom the Software is furnished to do
@@ -17,7 +17,7 @@ Command-line interface for borg-archive, a wrapper that allows Borg Backup to
  The above copyright notice and this permission notice shall be included in all
  copies or substantial portions of the Software.
 
- THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
  FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
  COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
@@ -64,20 +64,37 @@ def main():
     is_flag=True,
     help="Retain the expanded repository directory after the collapse operation.",
 )
-def collapse(repo_directory: str, archive_file: str, keep_repo: bool = False):
+@click.option(
+    "--max-compression",
+    is_flag=True,
+    default=False,
+    help="Apply maximum (level 9) outer-layer compression. Default uses light compression "
+    "since borg already compresses data internally.",
+)
+def collapse(
+    repo_directory: str,
+    archive_file: str,
+    keep_repo: bool = False,
+    max_compression: bool = False,
+):
     """Collapse REPO_DIRECTORY from `expand` command back into a single-file archive.
 
     REPO_DIRECTORY is the expanded repo from the `expand` command.
 
     ARCHIVE_FILE is the path to the single-file archive.  If the file exists,
-    it will be replaced, otherwise it is created.
+    you will be prompted before overwriting it.
 
     The repository REPO_DIRECTORY will be removed after archiving unless
     the --keep-repo option is provided.
     """
     try:
-        with BorgArchive(Path(archive_file)) as archive:
-            archive.collapse(repo_directory, retain_repo=keep_repo)
+        archive_path = Path(archive_file)
+        if archive_path.exists() and not confirm_overwrite(archive_path):
+            sys.exit(0)
+        with BorgArchive(archive_path) as archive:
+            archive.collapse(
+                repo_directory, retain_repo=keep_repo, max_compression=max_compression
+            )
     except BorgArchiveError as e:
         console.print(f"Failed to collapse the repository: {e}")
 
@@ -88,10 +105,18 @@ def collapse(repo_directory: str, archive_file: str, keep_repo: bool = False):
     "source_dir", type=click.Path(exists=True, file_okay=False, dir_okay=True)
 )
 @click.argument("borg_options", nargs=-1, type=click.UNPROCESSED)
+@click.option(
+    "--max-compression",
+    is_flag=True,
+    default=False,
+    help="Apply maximum (level 9) outer-layer compression. Default uses light compression "
+    "since borg already compresses data internally.",
+)
 def create(
     archive_file: str,
     source_dir: str,
     borg_options: tuple = (),
+    max_compression: bool = False,
 ):
     """
     Create a new archive from SOURCE_DIR.
@@ -112,6 +137,7 @@ def create(
                 source_dir=Path(source_dir),
                 encryption="none",
                 borg_options=list(borg_options) if borg_options else None,
+                max_compression=max_compression,
             )
     except BorgArchiveError as e:
         console.print(f"[red]Error:[/red] {e}")
@@ -267,7 +293,19 @@ def unmount(mount_dir: str):
     "source_dir_or_repo", type=click.Path(exists=True, file_okay=False, dir_okay=True)
 )
 @click.option("--tag", help="Tag for this update (default: auto-numbering)")
-def update(archive_or_repo: str, source_dir_or_repo: str, tag: Optional[str]):
+@click.option(
+    "--max-compression",
+    is_flag=True,
+    default=False,
+    help="Apply maximum (level 9) outer-layer compression. Default uses light compression "
+    "since borg already compresses data internally.",
+)
+def update(
+    archive_or_repo: str,
+    source_dir_or_repo: str,
+    tag: Optional[str],
+    max_compression: bool = False,
+):
     """
     Update ARCHIVE_OR_REPO with changes from SOURCE_DIR_OR_REPO.
 
@@ -309,7 +347,7 @@ def update(archive_or_repo: str, source_dir_or_repo: str, tag: Optional[str]):
         sys.exit(1)
     try:
         with BorgArchive(Path(archive_or_repo)) as archive:
-            archive.update(Path(source_dir_or_repo), tag)
+            archive.update(Path(source_dir_or_repo), tag, max_compression=max_compression)
     except BorgArchiveError as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
